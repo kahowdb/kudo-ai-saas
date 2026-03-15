@@ -6,6 +6,7 @@ export type IncomingDocument = {
 };
 
 export type StoredDocument = {
+  siteId: string;
   id: number;
   title: string;
   content: string;
@@ -13,6 +14,7 @@ export type StoredDocument = {
 };
 
 export type StoredChunk = {
+  siteId: string;
   text: string;
   embedding: number[];
   documentId: number;
@@ -21,6 +23,7 @@ export type StoredChunk = {
 };
 
 export type ChunkItem = {
+  siteId: string;
   text: string;
   embedding: number[];
   documentId: number;
@@ -52,3 +55,6 @@ export type ChunkListItem = {
 export type DeleteBody = {
   id?: number;
 };
+
+/** リクエストで渡すサイト識別子（同一APIで複数サイトのデータを分離する） */
+export const DEFAULT_SITE_ID = "default";

@@ -20,52 +20,101 @@ export async function initDb(databaseUrl: string): Promise<void> {
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY,
+        site_id TEXT NOT NULL DEFAULT 'default',
+        id INTEGER NOT NULL,
         title TEXT NOT NULL,
         content TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL
+        created_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (site_id, id)
       )
     `);
+
+    const hasDocsSiteId = await hasColumn(client, "documents", "site_id");
+    if (!hasDocsSiteId) {
+      await client.query("ALTER TABLE documents ADD COLUMN site_id TEXT NOT NULL DEFAULT 'default'");
+      await client.query("ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_pkey");
+      await client.query("ALTER TABLE documents ADD PRIMARY KEY (site_id, id)");
+    }
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS chunks (
         id BIGSERIAL PRIMARY KEY,
-        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        site_id TEXT NOT NULL DEFAULT 'default',
+        document_id INTEGER NOT NULL,
         document_title TEXT NOT NULL,
         chunk_index INTEGER NOT NULL,
         text TEXT NOT NULL,
         embedding VECTOR(1536) NOT NULL,
-        UNIQUE (document_id, chunk_index)
+        UNIQUE (site_id, document_id, chunk_index),
+        FOREIGN KEY (site_id, document_id) REFERENCES documents(site_id, id) ON DELETE CASCADE
       )
     `);
 
-    /*
-    件数が増えてきたら追加検討
-    CREATE INDEX chunks_embedding_cosine_idx
-    ON chunks
-    USING hnsw (embedding vector_cosine_ops);
-    */
+    const hasChunksSiteId = await hasColumn(client, "chunks", "site_id");
+    if (!hasChunksSiteId) {
+      await client.query("ALTER TABLE chunks ADD COLUMN site_id TEXT NOT NULL DEFAULT 'default'");
+      const fkName = await getChunksDocumentIdFkName(client);
+      if (fkName) await client.query(`ALTER TABLE chunks DROP CONSTRAINT IF EXISTS "${fkName}"`);
+      const uqName = await getChunksUniqueConstraintName(client);
+      if (uqName) await client.query(`ALTER TABLE chunks DROP CONSTRAINT IF EXISTS "${uqName}"`);
+      await client.query(`
+        ALTER TABLE chunks ADD CONSTRAINT chunks_site_document_fkey
+        FOREIGN KEY (site_id, document_id) REFERENCES documents(site_id, id) ON DELETE CASCADE
+      `);
+      await client.query(`
+        ALTER TABLE chunks ADD CONSTRAINT chunks_site_doc_index_key UNIQUE (site_id, document_id, chunk_index)
+      `);
+    }
   } finally {
     client.release();
   }
+}
+
+async function hasColumn(client: PoolClient, table: string, column: string): Promise<boolean> {
+  const r = await client.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+    [table, column]
+  );
+  return r.rowCount !== null && r.rowCount > 0;
+}
+
+async function getChunksDocumentIdFkName(client: PoolClient): Promise<string | null> {
+  const r = await client.query(
+    `SELECT constraint_name FROM information_schema.table_constraints
+     WHERE table_name = 'chunks' AND constraint_type = 'FOREIGN KEY'`
+  );
+  return r.rows[0] ? String(r.rows[0].constraint_name) : null;
+}
+
+async function getChunksUniqueConstraintName(client: PoolClient): Promise<string | null> {
+  const r = await client.query(
+    `SELECT constraint_name FROM information_schema.table_constraints
+     WHERE table_name = 'chunks' AND constraint_type = 'UNIQUE'`
+  );
+  return r.rows[0] ? String(r.rows[0].constraint_name) : null;
 }
 
 export function getPool(): Pool | null {
   return pool;
 }
 
-export async function listDocuments(): Promise<StoredDocument[]> {
+export async function listDocuments(siteId: string): Promise<StoredDocument[]> {
   if (!pool) {
     throw new Error("Database is not initialized");
   }
 
-  const result = await pool.query(`
-    SELECT id, title, content, created_at
+  const result = await pool.query(
+    `
+    SELECT site_id, id, title, content, created_at
     FROM documents
+    WHERE site_id = $1
     ORDER BY id DESC
-  `);
+  `,
+    [siteId]
+  );
 
   return result.rows.map((row) => ({
+    siteId: String(row.site_id),
     id: Number(row.id),
     title: String(row.title),
     content: String(row.content),
@@ -73,28 +122,34 @@ export async function listDocuments(): Promise<StoredDocument[]> {
   }));
 }
 
-export async function deleteDocumentById(id: number): Promise<boolean> {
+export async function deleteDocumentById(siteId: string, id: number): Promise<boolean> {
   if (!pool) {
     throw new Error("Database is not initialized");
   }
 
-  const result = await pool.query("DELETE FROM documents WHERE id = $1", [id]);
+  const result = await pool.query("DELETE FROM documents WHERE site_id = $1 AND id = $2", [
+    siteId,
+    id
+  ]);
   return (result.rowCount ?? 0) > 0;
 }
 
-export async function getDocumentById(id: number): Promise<StoredDocument | null> {
+export async function getDocumentById(
+  siteId: string,
+  id: number
+): Promise<StoredDocument | null> {
   if (!pool) {
     throw new Error("Database is not initialized");
   }
 
   const result = await pool.query(
     `
-      SELECT id, title, content, created_at
+      SELECT site_id, id, title, content, created_at
       FROM documents
-      WHERE id = $1
+      WHERE site_id = $1 AND id = $2
       LIMIT 1
     `,
-    [id]
+    [siteId, id]
   );
 
   if (result.rowCount === 0) {
@@ -104,6 +159,7 @@ export async function getDocumentById(id: number): Promise<StoredDocument | null
   const row = result.rows[0];
 
   return {
+    siteId: String(row.site_id),
     id: Number(row.id),
     title: String(row.title),
     content: String(row.content),
@@ -112,6 +168,7 @@ export async function getDocumentById(id: number): Promise<StoredDocument | null
 }
 
 export async function listChunks(
+  siteId: string,
   documentId?: number
 ): Promise<
   { documentId: number; documentTitle: string; chunkIndex: number; textLength: number; text: string }[]
@@ -120,21 +177,26 @@ export async function listChunks(
     throw new Error("Database is not initialized");
   }
 
-  const result = documentId === undefined
-    ? await pool.query(`
+  const result =
+    documentId === undefined
+      ? await pool.query(
+          `
         SELECT document_id, document_title, chunk_index, text
         FROM chunks
+        WHERE site_id = $1
         ORDER BY document_id DESC, chunk_index ASC
-      `)
-    : await pool.query(
-        `
+      `,
+          [siteId]
+        )
+      : await pool.query(
+          `
           SELECT document_id, document_title, chunk_index, text
           FROM chunks
-          WHERE document_id = $1
+          WHERE site_id = $1 AND document_id = $2
           ORDER BY chunk_index ASC
         `,
-        [documentId]
-      );
+          [siteId, documentId]
+        );
 
   return result.rows.map((row) => ({
     documentId: Number(row.document_id),
@@ -146,6 +208,7 @@ export async function listChunks(
 }
 
 export async function searchChunks(
+  siteId: string,
   queryEmbedding: number[],
   topK: number
 ): Promise<{ chunk: StoredChunk; score: number }[]> {
@@ -161,16 +224,18 @@ export async function searchChunks(
     const result = await client.query(
       `
         SELECT
+          site_id,
           document_id,
           document_title,
           chunk_index,
           text,
           embedding <=> $1::vector AS distance
         FROM chunks
+        WHERE site_id = $2
         ORDER BY embedding <=> $1::vector
-        LIMIT $2
+        LIMIT $3
       `,
-      [pgvector.toSql(queryEmbedding), topK]
+      [pgvector.toSql(queryEmbedding), siteId, topK]
     );
 
     return result.rows.map((row) => {
@@ -179,6 +244,7 @@ export async function searchChunks(
 
       return {
         chunk: {
+          siteId: String(row.site_id),
           text: String(row.text),
           embedding: [],
           documentId: Number(row.document_id),
@@ -209,7 +275,7 @@ export async function trainInTransaction(
 
     for (const doc of documents) {
       await upsertDocument(client, doc);
-      await deleteChunksByDocumentId(client, doc.id);
+      await deleteChunksByDocumentId(client, doc.siteId, doc.id);
     }
 
     for (const chunk of chunkItems) {
@@ -228,35 +294,40 @@ export async function trainInTransaction(
 async function upsertDocument(client: PoolClient, doc: StoredDocument): Promise<void> {
   await client.query(
     `
-      INSERT INTO documents (id, title, content, created_at)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (id)
+      INSERT INTO documents (site_id, id, title, content, created_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (site_id, id)
       DO UPDATE SET
         title = EXCLUDED.title,
         content = EXCLUDED.content,
         created_at = EXCLUDED.created_at
     `,
-    [doc.id, doc.title, doc.content, doc.createdAt]
+    [doc.siteId, doc.id, doc.title, doc.content, doc.createdAt]
   );
 }
 
-async function deleteChunksByDocumentId(client: PoolClient, documentId: number): Promise<void> {
+async function deleteChunksByDocumentId(
+  client: PoolClient,
+  siteId: string,
+  documentId: number
+): Promise<void> {
   await client.query(
     `
       DELETE FROM chunks
-      WHERE document_id = $1
+      WHERE site_id = $1 AND document_id = $2
     `,
-    [documentId]
+    [siteId, documentId]
   );
 }
 
 async function insertChunk(client: PoolClient, chunk: ChunkItem): Promise<void> {
   await client.query(
     `
-      INSERT INTO chunks (document_id, document_title, chunk_index, text, embedding)
-      VALUES ($1, $2, $3, $4, $5::vector)
+      INSERT INTO chunks (site_id, document_id, document_title, chunk_index, text, embedding)
+      VALUES ($1, $2, $3, $4, $5, $6::vector)
     `,
     [
+      chunk.siteId,
       chunk.documentId,
       chunk.documentTitle,
       chunk.chunkIndex,

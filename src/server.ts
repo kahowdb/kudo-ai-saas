@@ -12,6 +12,7 @@ import type {
   StoredDocument,
   StoredChunk
 } from "./types";
+import { DEFAULT_SITE_ID } from "./types";
 
 dotenv.config();
 
@@ -95,23 +96,34 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-/** クエリに似たチャンクを上位 topK 件取得（スコア付きで返す）※メモリ用 */
+/** リクエストからサイト識別子を取得（ヘッダー X-Site-Id、未指定時は default） */
+function getSiteId(request: { headers?: { [k: string]: string | string[] | undefined } }): string {
+  const raw = request.headers?.["x-site-id"] ?? request.headers?.["X-Site-Id"];
+  const str = Array.isArray(raw) ? raw[0] : raw;
+  const trimmed = typeof str === "string" ? str.trim() : "";
+  return trimmed || DEFAULT_SITE_ID;
+}
+
+/** クエリに似たチャンクを上位 topK 件取得（スコア付きで返す）※メモリ用・siteId でフィルタ */
 function searchChunksMemory(
+  siteId: string,
   queryEmbedding: number[],
   topK: number
 ): { chunk: StoredChunk; score: number }[] {
   return [...chunks]
+    .filter((c) => c.siteId === siteId)
     .map((c) => ({ chunk: c, score: cosineSimilarity(queryEmbedding, c.embedding) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
 }
 
 async function searchChunks(
+  siteId: string,
   queryEmbedding: number[],
   topK: number
 ): Promise<{ chunk: StoredChunk; score: number }[]> {
-  if (isDbEnabled()) return db.searchChunks(queryEmbedding, topK);
-  return searchChunksMemory(queryEmbedding, topK);
+  if (isDbEnabled()) return db.searchChunks(siteId, queryEmbedding, topK);
+  return searchChunksMemory(siteId, queryEmbedding, topK);
 }
 
 const documents: StoredDocument[] = [];
@@ -121,23 +133,27 @@ function isDbEnabled(): boolean {
   return !!db.getPool();
 }
 
-async function listDocumentsStore(): Promise<DocumentListItem[]> {
+async function listDocumentsStore(siteId: string): Promise<DocumentListItem[]> {
   if (isDbEnabled()) {
-    const list = await db.listDocuments();
+    const list = await db.listDocuments(siteId);
     return list.map((d) => ({ id: d.id, title: d.title, contentLength: d.content.length, createdAt: d.createdAt }));
   }
-  return documents.map((d) => ({ id: d.id, title: d.title, contentLength: d.content.length, createdAt: d.createdAt }));
+  return documents
+    .filter((d) => d.siteId === siteId)
+    .map((d) => ({ id: d.id, title: d.title, contentLength: d.content.length, createdAt: d.createdAt }));
 }
 
-async function getDocumentStore(id: number): Promise<StoredDocument | null> {
-  if (isDbEnabled()) return db.getDocumentById(id);
-  return documents.find((d) => d.id === id) ?? null;
+async function getDocumentStore(siteId: string, id: number): Promise<StoredDocument | null> {
+  if (isDbEnabled()) return db.getDocumentById(siteId, id);
+  return documents.find((d) => d.siteId === siteId && d.id === id) ?? null;
 }
 
-async function listChunksStore(documentId?: number): Promise<ChunkListItem[]> {
-  if (isDbEnabled()) return db.listChunks(documentId);
+async function listChunksStore(siteId: string, documentId?: number): Promise<ChunkListItem[]> {
+  if (isDbEnabled()) return db.listChunks(siteId, documentId);
   const filtered =
-    documentId === undefined ? chunks : chunks.filter((c) => c.documentId === documentId);
+    documentId === undefined
+      ? chunks.filter((c) => c.siteId === siteId)
+      : chunks.filter((c) => c.siteId === siteId && c.documentId === documentId);
   return filtered.map((c) => ({
     documentId: c.documentId,
     documentTitle: c.documentTitle,
@@ -155,17 +171,19 @@ app.get("/health", async () => {
   };
 });
 
-app.get("/documents", async () => {
-  const list = await listDocumentsStore();
+app.get("/documents", async (request) => {
+  const siteId = getSiteId(request);
+  const list = await listDocumentsStore(siteId);
   return { ok: true, count: list.length, documents: list };
 });
 
 app.get<{ Params: { id: string } }>("/documents/:id", async (request, reply) => {
+  const siteId = getSiteId(request);
   const id = Number(request.params.id);
   if (!Number.isInteger(id) || id < 1) {
     return reply.status(400).send({ ok: false, error: "Invalid document id" });
   }
-  const doc = await getDocumentStore(id);
+  const doc = await getDocumentStore(siteId, id);
   if (!doc) {
     return reply.status(404).send({ ok: false, error: "Document not found" });
   }
@@ -181,13 +199,14 @@ app.get<{ Params: { id: string } }>("/documents/:id", async (request, reply) => 
 });
 
 app.get<{ Querystring: { documentId?: string } }>("/chunks", async (request, reply) => {
+  const siteId = getSiteId(request);
   const documentIdParam = request.query?.documentId;
   const documentId = documentIdParam != null && documentIdParam !== "" ? Number(documentIdParam) : undefined;
   if (documentId !== undefined && !Number.isInteger(documentId)) {
     return reply.status(400).send({ ok: false, error: "documentId must be an integer" });
   }
 
-  const list = await listChunksStore(documentId);
+  const list = await listChunksStore(siteId, documentId);
 
   return {
     ok: true,
@@ -197,6 +216,7 @@ app.get<{ Querystring: { documentId?: string } }>("/chunks", async (request, rep
 });
 
 app.post("/ask", async (request, reply) => {
+  const siteId = getSiteId(request);
   const body = request.body as AskBody | undefined;
   const question = body?.question?.trim();
 
@@ -216,11 +236,12 @@ app.post("/ask", async (request, reply) => {
 
   try {
     const queryEmbedding = await embedText(question);
-    const topChunksWithScore = await searchChunks(queryEmbedding, TOP_K_CHUNKS);
+    const topChunksWithScore = await searchChunks(siteId, queryEmbedding, TOP_K_CHUNKS);
     const relevantChunksWithScore = topChunksWithScore.filter(({ score }) => score >= MIN_CHUNK_SCORE);
     const chunksDiscarded = topChunksWithScore.length - relevantChunksWithScore.length;
 
-    const wpBase = process.env.WP_SITE_URL ? process.env.WP_SITE_URL.replace(/\/$/, "") : "";
+    const wpBase =
+      siteId.startsWith("http") ? siteId.replace(/\/$/, "") : (process.env.WP_SITE_URL ?? "").replace(/\/$/, "");
 
     if (relevantChunksWithScore.length === 0) {
       const suggestedSources =
@@ -311,7 +332,8 @@ ${context}`
 });
 
 app.post("/train", async (request, reply) => {
-  app.log.info({ trainBody: request.body }, "Incoming /train body");
+  const siteId = getSiteId(request);
+  app.log.info({ siteId, trainBody: request.body }, "Incoming /train body");
   const body = request.body as TrainBody | undefined;
   const incoming = body?.documents;
 
@@ -351,6 +373,7 @@ app.post("/train", async (request, reply) => {
     }
 
     const document: StoredDocument = {
+      siteId,
       id,
       title,
       content,
@@ -362,7 +385,13 @@ app.post("/train", async (request, reply) => {
     const sourceText = `# ${title}\n\n${content}`;
     const docChunks = splitText(sourceText);
     for (let i = 0; i < docChunks.length; i++) {
-      textsToEmbed.push({ text: docChunks[i], documentId: id, documentTitle: title, chunkIndex: i });
+      textsToEmbed.push({
+        siteId,
+        text: docChunks[i],
+        documentId: id,
+        documentTitle: title,
+        chunkIndex: i
+      });
     }
   }
 
@@ -400,6 +429,7 @@ app.post("/train", async (request, reply) => {
       await db.trainInTransaction(
         stored,
         textsToEmbed.map((b, i) => ({
+          siteId: b.siteId,
           text: b.text,
           embedding: vectors[i],
           documentId: b.documentId,
@@ -416,16 +446,17 @@ app.post("/train", async (request, reply) => {
     }
   } else {
     for (const doc of stored) {
-      const existingDocIndex = documents.findIndex((d) => d.id === doc.id);
+      const existingDocIndex = documents.findIndex((d) => d.siteId === siteId && d.id === doc.id);
       if (existingDocIndex !== -1) documents.splice(existingDocIndex, 1);
       for (let i = chunks.length - 1; i >= 0; i--) {
-        if (chunks[i].documentId === doc.id) chunks.splice(i, 1);
+        if (chunks[i].siteId === siteId && chunks[i].documentId === doc.id) chunks.splice(i, 1);
       }
     }
     for (const doc of stored) documents.push(doc);
     for (let i = 0; i < textsToEmbed.length; i++) {
       const b = textsToEmbed[i];
       chunks.push({
+        siteId: b.siteId,
         text: b.text,
         embedding: vectors[i],
         documentId: b.documentId,
@@ -450,6 +481,7 @@ app.post("/train", async (request, reply) => {
 });
 
 app.post("/delete", async (request, reply) => {
+  const siteId = getSiteId(request);
   const body = request.body as DeleteBody | undefined;
   const id = body?.id;
 
@@ -462,7 +494,7 @@ app.post("/delete", async (request, reply) => {
 
   if (isDbEnabled()) {
     try {
-      const deleted = await db.deleteDocumentById(id);
+      const deleted = await db.deleteDocumentById(siteId, id);
       return {
         ok: true,
         deleted,
@@ -477,12 +509,12 @@ app.post("/delete", async (request, reply) => {
     }
   }
 
-  const docIndex = documents.findIndex((d) => d.id === id);
+  const docIndex = documents.findIndex((d) => d.siteId === siteId && d.id === id);
   if (docIndex !== -1) {
     documents.splice(docIndex, 1);
   }
   for (let i = chunks.length - 1; i >= 0; i--) {
-    if (chunks[i].documentId === id) {
+    if (chunks[i].siteId === siteId && chunks[i].documentId === id) {
       chunks.splice(i, 1);
     }
   }
