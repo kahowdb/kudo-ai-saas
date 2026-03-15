@@ -6,7 +6,10 @@ let pool: Pool | null = null;
 
 export async function initDb(databaseUrl: string): Promise<void> {
   pool = new Pool({
-    connectionString: databaseUrl
+    connectionString: databaseUrl,
+    ssl: {
+      rejectUnauthorized: false
+    }
   });
 
   const client = await pool.connect();
