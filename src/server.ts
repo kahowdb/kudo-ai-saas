@@ -254,11 +254,27 @@ app.post("/ask", async (request, reply) => {
             }))
           : [];
 
+      let answer: string;
+
+      if (suggestedSources.length > 0) {
+        answer =
+          "このサイトの記事からは、ご質問にそのまま当てはまる情報はまだ見つかりませんでしたが、近い内容の記事をいくつか「参照元」にまとめました。気になる記事があれば、そちらをご覧ください。";
+      } else if (wpBase) {
+        // 参照元に出せる候補がない場合でも、制作実績ページなどに誘導してあげる
+        const worksUrl = `${wpBase}/category/works/`;
+        answer =
+          `今のご質問にそのまま答えられる記事は、まだこのサイトには掲載されていないようです。\n` +
+          `ただし、さまざまな制作実績は次のページにまとめていますので、参考としてご覧ください。\n` +
+          `${worksUrl}`;
+      } else {
+        answer =
+          "今のご質問にそのまま答えられる記事は、まだこのサイトには掲載されていないようです。よろしければ、もう少し具体的な条件（例：業種・予算・地域など）を教えていただければ、近い内容を一緒に探してみます。";
+      }
+
       return {
         ok: true,
         question,
-        answer:
-          "このサイトの記事からは、はっきりした情報が見つかりませんでした。ただ、参考になりそうな記事があれば「参照元」からご確認いただけます。",
+        answer,
         chunksUsed: 0,
         chunksDiscarded,
         sources: suggestedSources,
