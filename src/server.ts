@@ -244,7 +244,7 @@ app.post("/ask", async (request, reply) => {
       siteId.startsWith("http") ? siteId.replace(/\/$/, "") : (process.env.WP_SITE_URL ?? "").replace(/\/$/, "");
 
     if (relevantChunksWithScore.length === 0) {
-      const suggestedSources =
+      let suggestedSources =
         topChunksWithScore.length > 0
           ? topChunksWithScore.slice(0, TOP_K_CHUNKS).map(({ chunk }) => ({
               documentId: chunk.documentId,
@@ -262,10 +262,16 @@ app.post("/ask", async (request, reply) => {
       } else if (wpBase) {
         // 参照元に出せる候補がない場合でも、制作実績ページなどに誘導してあげる
         const worksUrl = `${wpBase}/category/works/`;
+        suggestedSources = [
+          {
+            documentId: 0,
+            documentTitle: "制作事例・制作実績ページ",
+            preview: "",
+            url: worksUrl
+          }
+        ];
         answer =
-          `今のご質問にそのまま答えられる記事は、まだこのサイトには掲載されていないようです。\n` +
-          `ただし、さまざまな制作実績は次のページにまとめていますので、参考としてご覧ください。\n` +
-          `${worksUrl}`;
+          "今のご質問にそのまま答えられる記事は、まだこのサイトには掲載されていないようです。ただし、さまざまな制作実績は「参照元」に表示しているページにまとめていますので、参考としてご覧ください。";
       } else {
         answer =
           "今のご質問にそのまま答えられる記事は、まだこのサイトには掲載されていないようです。よろしければ、もう少し具体的な条件（例：業種・予算・地域など）を教えていただければ、近い内容を一緒に探してみます。";
